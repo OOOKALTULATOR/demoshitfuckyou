@@ -1,0 +1,305 @@
+Настройка hostname
+hostnamectl set-hostname ISP
+exec bash
+
+ISP
+Если таких директорий не существует, то нужно их создать
+mkdir /etc/net/ifaces/ens161
+В каждой папке нужно создать файл /etc/net/iface/<NAME_INTERFACE>/options
+TYPE=eth
+DISABLE=no
+NM_CONTROLLED=no
+BOOTPROTO=static
+CONFIG_IPV4=yes
+CONFIG_IPV6=yes
+
+echo 2.2.2.1/30 > /etc/net/ifaces/ens161/ipv4address
+echo default via 10.12.66.254 > /etc/net/ifaces/ens192/ipv4route
+Для включения маршрутизации нужно изменить опцию net.ipv4.ip_forward = 0 на net.ipv4.ip_forward = 1. Эта 
+настройка находится в файле /etc/net/sysctl.conf
+vim /etc/net/sysctl.conf
+systemctl restart network
+
+Настойка сети на HQ-R и на BR-R
+mkdir /etc/net/ifaces/ens192
+/etc/net/ifaces/ens192/options
+echo 192.168.0.1/25 > /etc/net/ifaces/ens192/ipv4address
+echo default via 1.1.1.1 > /etc/net/ifaces/ens224/ipv4route
+/etc/net/sysctl.conf
+ping 1.1.1.1
+
+Настойка сети на HQ-SRV и на BR-SRV
+/etc/net/ifaces/ens192/options
+echo 192.168.0.2/25 > /etc/net/ifaces/ens192/ipv4address
+echo default via 192.168.0.1 > /etc/net/ifaces/ens192/ipv4route
+/etc/net/sysctl.conf
+ping 192.168.0.1
+
+Создание туннелей между HQ-R и BR-R
+Перед настройкой туннеля необходимо проверить, что между HQ-R и BR-R есть связь
+ping 2.2.2.2
+HQ-R
+mkdir /etc/net/ifaces/tun1
+echo 172.16.0.1/30 > /etc/net/ifaces/tun1/ipv4address
+echo "TYPE=iptun
+TUNTYPE=gre
+TUNLOCAL=1.1.1.2
+TUNREMOTE=2.2.2.2
+TUNOPTIONS='ttl 64'
+HOST=ens224
+" > /etc/net/ifaces/tun1/options
+systemctl restart network
+БР-Р
+mkdir /etc/net/ifaces/tun1
+echo 172.16.0.2/30 > /etc/net/ifaces/tun1/ipv4address
+echo "TYPE=iptun
+TUNTYPE=gre
+TUNLOCAL=2.2.2.2
+TUNREMOTE=1.1.1.2
+TUNOPTIONS='ttl 64'
+HOST=ens192
+" > /etc/net/ifaces/tun1/options
+systemctl restart network
+
+Настройка динамической маршрутизации
+HQ-R
+Выключаем HQ-R и доставляем еще один интерфейс с сетью VMnetwork.
+Для него важен свободный IP из сети VMnetwork. У меня это сеть 10.12.66.0/24
+
+10.12.66.1 занят под сам ESXi
+10.12.66.2 занятость под провайдером
+10.12.66.3 на значимом HQ-R
+10.12.66.4 значимый БР-Р
+Настройка IP, шлюза и DNS на ens256
+
+Удаляем шлюз с ens224. После установки FRR нужно будет все вернуть назад.
+mkdir /etc/net/ifaces/ens256
+echo "TYPE=eth
+DISABLED=no
+NM_CONTROLLED=no
+BOOTPROTO=static
+CONFIG_IPv4=yes" > /etc/net/ifaces/ens256/options
+echo 10.12.66.3/24 > /etc/net/ifaces/ens256/ipv4address
+echo default via 10.12.66.254 > /etc/net/ifaces/ens256/ipv4route
+echo nameserver 8.8.8.8 > /etc/net/ifaces/ens256/resolv.conf
+rm -rf /etc/net/ifaces/ens224/ipv4route
+systemctl restart network
+apt-get update
+Теперь можем оставить frrи отключить его
+
+apt-get install frr
+systemctl enable --now frr
+БР-Р
+mkdir /etc/net/ifaces/ens256
+echo "TYPE=eth
+DISABLED=no
+NM_CONTROLLED=no
+BOOTPROTO=static
+CONFIG_IPv4=yes" > /etc/net/ifaces/ens256/options
+echo 10.12.66.4/24 > /etc/net/ifaces/ens256/ipv4address
+echo default via 10.12.66.254 > /etc/net/ifaces/ens256/ipv4route
+echo nameserver 8.8.8.8 > /etc/net/ifaces/ens256/resolv.conf
+rm -rf /etc/net/ifaces/ens192/ipv4route
+systemctl restart network
+apt-get install frr
+systemctl enable --now frr
+Теперь нужно отключить интернет
+HQ-R
+rm -rf /etc/net/ifaces/ens256
+echo default via 1.1.1.1 > /etc/net/ifaces/ens224/ipv4route
+systemctl reboot
+БР-Р
+rm -rf /etc/net/ifaces/ens256
+echo default via 2.2.2.1 > /etc/net/ifaces/ens192/ipv4route
+systemctl reboot
+
+Настройка FRR
+HQ-R
+В файле /etc/frr/daemonsактивируемый протоколOSPF
+
+sed -i -e 's/ospfd=no/ospfd=yes/g' /etc/frr/daemons
+systemctl restart frr
+Настраиваем OSPFv2 — переход в интерфейс с помощью команды vtysh:
+
+HQ-R# conf t
+HQ-R(config)# router ospf
+HQ-R(config-router)# passive-interface default 
+HQ-R(config-router)# network 192.168.0.0/25 area 0
+HQ-R(config-router)# network 172.16.0.0/30 area 0
+HQ-R(config-router)# exit
+HQ-R(config)# int tun1 
+HQ-R(config-if)# ip ospf network point-to-point 
+HQ-R(config-if)# no ip ospf passive 
+HQ-R(config-if)# do wr
+БР-Р
+В файле /etc/frr/daemonsактивируемый протоколOSPF
+
+sed -i -e 's/ospfd=no/ospfd=yes/g' /etc/frr/daemons
+systemctl restart frr
+Настраиваем OSPFv2 — переход в интерфейс с помощью команды vtysh:
+
+BR-R# conf t
+BR-R(config)# router ospf
+BR-R(config-router)# passive-interface default 
+BR-R(config-router)# network 192.168.0.128/27 area 0
+BR-R(config-router)# network 172.16.0.0/30 area 0
+BR-R(config-router)# int tun1
+BR-R(config-if)# ip ospf network point-to-point 
+BR-R(config-if)# no ip ospf passive 
+BR-R(config-if)# do wr
+
+Настройка автоматической раздачи IP-адресов на HQ-R
+Устанавливаемdhcp-server
+
+apt-get install dhcp-server
+В первую очередь настроим на каком интерфейсе будет работать DHCP-сервер
+
+В моем случае это ens192.
+
+Отредактируемый файл/etc/sysconfig/dhcpd
+
+sed -i -e 's/DHCPDARGS=/DHCPDARGS=ens192/g' /etc/sysconfig/dhcpd
+проверьте, что все получилось правильно
+
+cat /etc/sysconfig/dhcpd
+В комплекте с DHCP-сервером есть примерная схема, которая находится здесь./etc/dhcp/
+
+Воспользуемся самым простым алгоритмом
+
+cp /etc/dhcp/dhcpd.conf.sample /etc/dhcp/dhcpd.conf
+Теперь редактируемый/etc/dhcp/dhcpd.conf
+
+vim /etc/dhcp/dhcpd.conf
+Приводим его к соответствующему мнению.
+
+# See dhcpd.conf(5) for further configuration
+
+ddns-update-style none;
+
+subnet 192.168.0.0 netmask 255.255.255.128 {
+        option routers                  192.168.0.1;
+        option subnet-mask              255.255.255.128;
+
+#       option nis-domain               "domain.org";
+#       option domain-name              "domain.org";
+#       option domain-name-servers      192.168.1.1;
+
+        range dynamic-bootp 192.168.0.2 192.168.0.100;
+        default-lease-time 21600;
+        max-lease-time 43200;
+
+        host HQ-SRV
+        {
+        hardware ethernet 00:50:56:b6:89:75;
+        fixed-address 192.168.0.2;
+        }
+}
+   host HQ-SRV
+        {
+        hardware ethernet 00:50:56:b6:89:75;
+        fixed-address 192.168.0.2;
+        }
+Включаем DHCP-сервер
+
+systemctl enable --now dhcpd
+Проверка
+
+systemctl status dhcpd
+Настройка HQ-SRV для автоматического получения IP-адреса
+Удаляем текущую статическую конфигурацию.
+
+rm -f /etc/net/ifaces/ens192/ipv4address 
+rm -f /etc/net/ifaces/ens192/ipv4route
+Изменить вариант получения адреса
+
+sed -i -e 's/BOOTPROTO=static/BOOTPROTO=dhcp/g' /etc/net/ifaces/ens192/options
+Перезагружаем сеть
+
+systemctl restart network
+
+Создание пользователей
+Создаем пользователя
+
+adduser admin
+Добавляем его в группу суперпользователя
+
+usermod -aG root admin
+Задаем пароль
+
+passwd admin
+
+Enter new password: P@ssw0rd
+Re-type new password: P@ssw0rd
+HQ-R и HQ-SRV
+useradd admin
+usermod -aG root admin
+passwd admin
+adduser network_admin
+usermod -aG root network_admin
+passwd network_admin
+БР-Р и БР-СРВ
+adduser network_admin
+usermod -aG root network_admin
+passwd network_admin
+adduser branch_admin
+usermod -aG root branch_admin
+passwd branch_admin
+
+Измерение пропускной способности при помощи iperf3
+Установим пакет iperf3на HQ-RиISP
+
+apt-get install iperf3
+На ISPзагрузку iperf3в качестве сервера
+
+iperf3 -s
+На HQ-Rзаказ iperf3в качестве клиента. После -cпишем IP провайдера
+
+iperf3 -c 1.1.1.1
+
+
+Создаем резервную конфигурацию настроек FRR
+Конфигурация FRR хранится в /etc/frr/frr.conf.
+
+Нужно ее просто скопировать по расписанию
+
+Создан ключ для хранения резервной копии.
+
+mkdir /vat/backup
+Добавить задание в планировщик cronetab
+
+cronetab -e
+0 0 * * * cp /etc/frr/frr.conf /vat/backup
+Конфигурация будет копироваться каждый день в 00:00
+
+DHCP
+subnet 172.16.10.0 netmask 255.255.255.0 {
+      range 172.16.10.2 172.16.10.254;
+      option routers 172.16.10.1;
+      option domain-name-servers 77.88.8.8, 172.16.10.2, 192.168.100.2;
+      option domain-name "exam.oaks";
+      option broadcast-address 172.16.10.255;
+      default-lease-time 600;
+      max-lease-time 7200;
+}
+subnet 192.168.100.0 netmask 255.255.255.0 {
+      range 192.168.100.2 192.168.100.254;
+      option routers 192.168.100.1;
+      option domain-name-servers 77.88.8.8, 192.168.100.2, 172.16.10.2;
+      option domain-name "exam.oaks";
+      option broadcast-address 192.168.100.255;
+      default-lease-time 600;
+      max-lease-time 7200;
+}
+host srv-1 {
+      hardware ehernet MAC_ADDRESS;
+      fixed-address 172.16.10.2;
+}
+host srv-2 {
+      hardware ethernet MAC_ADDRESS;
+      fixed-address 192.168.100.2;
+}
+
+Все. 
+
+systemctl enable dhcpd --now
+systemctl status dhcpd
